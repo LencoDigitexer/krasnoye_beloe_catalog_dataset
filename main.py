@@ -116,7 +116,7 @@ def save_product_to_db(conn, product_data):
             ))
             conn.commit()
             print(f"    Добавлен: {product_data.get('name')}")
-        
+         
         return True
     except Exception as e:
         print(f"    Ошибка сохранения в БД: {e}")
