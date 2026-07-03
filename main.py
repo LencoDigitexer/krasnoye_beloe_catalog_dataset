@@ -5,12 +5,217 @@ import os
 import requests
 from urllib.parse import urljoin, urlparse
 import re
+import sqlite3
+from datetime import datetime
 
 # Настройки
 BASE_URL = "https://krasnoeibeloe.ru"
 CATALOG_URL = "https://krasnoeibeloe.ru/catalog/"
 OUTPUT_DIR = "catalog"
+DB_FILE = "krasnoe_beloe_products.db"
 DOWNLOAD_TIMEOUT = 30
+
+def init_database():
+    """Инициализация базы данных SQLite"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Создаем таблицу товаров
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id TEXT UNIQUE,
+            name TEXT NOT NULL,
+            category TEXT,
+            url TEXT,
+            image_url TEXT,
+            country TEXT,
+            details TEXT,
+            price REAL,
+            currency TEXT,
+            rating REAL,
+            discount_price REAL,
+            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(product_id)
+        )
+    ''')
+    
+    # Создаем индексы для ускорения поиска
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_product_id ON products(product_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_category ON products(category)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_name ON products(name)')
+    
+    conn.commit()
+    return conn
+
+def save_product_to_db(conn, product_data):
+    """Сохраняет товар в базу данных"""
+    cursor = conn.cursor()
+    
+    # Не сохраняем товары без product_id
+    if not product_data.get('product_id'):
+        print(f"    Пропущен товар без ID: {product_data.get('name', 'Unknown')}")
+        return False
+    
+    try:
+        # Проверяем существует ли товар
+        cursor.execute('SELECT id FROM products WHERE product_id = ?', (product_data.get('product_id'),))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # Обновляем существующую запись
+            cursor.execute('''
+                UPDATE products SET 
+                    name = ?,
+                    category = ?,
+                    url = ?,
+                    image_url = ?,
+                    country = ?,
+                    details = ?,
+                    price = ?,
+                    currency = ?,
+                    rating = ?,
+                    discount_price = ?,
+                    scraped_at = ?
+                WHERE product_id = ?
+            ''', (
+                product_data.get('name'),
+                product_data.get('category'),
+                product_data.get('url'),
+                product_data.get('image_url'),
+                product_data.get('country'),
+                product_data.get('details'),
+                product_data.get('price'),
+                product_data.get('currency'),
+                product_data.get('rating'),
+                product_data.get('discount_price'),
+                datetime.now(),
+                product_data.get('product_id')
+            ))
+            conn.commit()
+            print(f"    Обновлено: {product_data.get('name')}")
+        else:
+            # Вставляем новую запись
+            cursor.execute('''
+                INSERT INTO products 
+                (product_id, name, category, url, image_url, country, details, price, currency, rating, discount_price, scraped_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                product_data.get('product_id'),
+                product_data.get('name'),
+                product_data.get('category'),
+                product_data.get('url'),
+                product_data.get('image_url'),
+                product_data.get('country'),
+                product_data.get('details'),
+                product_data.get('price'),
+                product_data.get('currency'),
+                product_data.get('rating'),
+                product_data.get('discount_price'),
+                datetime.now()
+            ))
+            conn.commit()
+            print(f"    Добавлен: {product_data.get('name')}")
+        
+        return True
+    except Exception as e:
+        print(f"    Ошибка сохранения в БД: {e}")
+        conn.rollback()
+        return False
+
+def extract_product_from_card(card_div, category_name):
+    """Извлекает данные о товаре из HTML карточки"""
+    product_data = {
+        'category': category_name
+    }
+    
+    # Извлекаем product_id из id элемента (bx_3966226736_4255608)
+    product_id = card_div.get('id', '')
+    if product_id:
+        # Извлекаем последний номер после последнего подчеркивания
+        id_match = re.search(r'bx_\d+_(\d+)', product_id)
+        if id_match:
+            product_data['product_id'] = id_match.group(1)
+    
+    # Название товара (itemprop="name")
+    name_div = card_div.find('div', itemprop='name')
+    if name_div:
+        name_link = name_div.find('a')
+        product_data['name'] = name_link.get_text(strip=True) if name_link else ''
+        # URL товара
+        if name_link and name_link.get('href'):
+            product_data['url'] = urljoin(BASE_URL, name_link['href'])
+    
+    # Изображение (itemprop="image")
+    img = card_div.find('img', itemprop='image')
+    if img and img.get('src'):
+        img_src = img['src']
+        if img_src.startswith('//'):
+            img_src = 'https:' + img_src
+        product_data['image_url'] = img_src
+    
+    # Страна (из country-flag)
+    country_flag = card_div.find('div', class_='country-flag')
+    if country_flag:
+        style = country_flag.get('style', '')
+        # Извлекаем URL флага
+        img_match = re.search(r'url\(["\']?([^"\')]+)', style)
+        if img_match:
+            country_url = img_match.group(1)
+            # Извлекаем название страны из URL или имени файла
+            country_name = os.path.splitext(os.path.basename(country_url))[0]
+            product_data['country'] = country_name
+    
+    # Детали (объем, регион, крепость)
+    subtitle = card_div.find('div', class_='product-subtitle')
+    if subtitle:
+        p_tag = subtitle.find('p')
+        if p_tag:
+            product_data['details'] = p_tag.get_text(strip=True)
+    
+    # Цена (itemprop="offers")
+    offer_div = card_div.find('div', itemprop='offers', itemtype='http://schema.org/Offer')
+    if offer_div:
+        # Основная цена
+        price_meta = offer_div.find('meta', itemprop='price')
+        if price_meta and price_meta.get('content'):
+            try:
+                product_data['price'] = float(price_meta['content'])
+            except:
+                pass
+        
+        currency_meta = offer_div.find('meta', itemprop='priceCurrency')
+        if currency_meta and currency_meta.get('content'):
+            product_data['currency'] = currency_meta['content']
+    
+    # Цена со скидкой (если есть класс discount-price)
+    if card_div.get('discount-price'):
+        # Ищем цену со скидкой
+        discount_div = card_div.find('div', class_='i_price', style=re.compile(r'display:\s*none'))
+        if discount_div:
+            price_span = discount_div.find('span', class_='price__value')
+            decimals_span = discount_div.find('span', class_='price__decimals')
+            if price_span:
+                try:
+                    price_value = price_span.get_text(strip=True)
+                    decimals = decimals_span.get_text(strip=True) if decimals_span else ''
+                    discount_price = float(price_value + decimals)
+                    product_data['discount_price'] = discount_price
+                except:
+                    pass
+    
+    # Рейтинг
+    rate_wrapper = card_div.find('div', class_='rate-wrapper')
+    if rate_wrapper:
+        # Ищем активный rating (checked)
+        checked_input = rate_wrapper.find('input', type='radio', checked=True)
+        if checked_input and checked_input.get('value'):
+            try:
+                product_data['rating'] = float(checked_input['value'])
+            except:
+                pass
+    
+    return product_data
 
 def get_catalog_links(page):
     """Парсит ссылки из левого меню каталога (class='left_catalog_c')"""
@@ -81,15 +286,13 @@ def get_max_page_number(soup):
     pagination = soup.find('div', class_='bl_pagination')
     
     if not pagination:
-        return 1  # Если пагинации нет, значит только 1 страница
+        return 1
     
-    # Ищем все ссылки в пагинации
     all_links = pagination.find_all('a')
     
     max_page = 1
     for link in all_links:
         href = link.get('href', '')
-        # Ищем параметр PAGEN_1 в URL
         match = re.search(r'PAGEN_1=(\d+)', href)
         if match:
             page_num = int(match.group(1))
@@ -121,7 +324,6 @@ def extract_images_from_page(soup):
     """Извлекает все картинки товаров со страницы"""
     images = []
     
-    # Вариант 1: Ищем все img в карточках товаров
     product_cards = soup.find_all(['div', 'article'], class_=re.compile(r'product|item|card', re.I))
     for card in product_cards:
         img = card.find('img')
@@ -130,7 +332,6 @@ def extract_images_from_page(soup):
         elif img and img.get('data-src'):
             images.append(img['data-src'])
     
-    # Вариант 2: Ищем все img на странице
     if not images:
         all_imgs = soup.find_all('img')
         for img in all_imgs:
@@ -139,7 +340,6 @@ def extract_images_from_page(soup):
                 if any(x in src.lower() for x in ['upload', 'product', 'catalog', 'images']):
                     images.append(src)
     
-    # Убираем дубликаты и формируем полные URL
     unique_images = []
     seen = set()
     for img_url in images:
@@ -154,7 +354,7 @@ def extract_images_from_page(soup):
     
     return unique_images
 
-def get_category_images(page, category_url, category_name):
+def get_category_images(page, category_name, category_url, db_conn):
     """Парсит и скачивает все картинки из категории с учётом пагинации"""
     print(f"\nОткрываю категорию: {category_name}")
     
@@ -162,11 +362,10 @@ def get_category_images(page, category_url, category_name):
         page.goto(category_url, wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
         print(f"  Ошибка загрузки страницы: {e}")
-        return 0
+        return 0, 0
     
     time.sleep(3)
     
-    # Получаем HTML первой страницы чтобы узнать количество страниц
     html = page.content()
     soup = BeautifulSoup(html, 'html.parser')
     max_pages = get_max_page_number(soup)
@@ -178,22 +377,21 @@ def get_category_images(page, category_url, category_name):
     os.makedirs(category_dir, exist_ok=True)
     
     all_images = []
+    total_products = 0
+    saved_products = 0
     
     # Проходим по всем страницам
     for page_num in range(1, max_pages + 1):
         print(f"\n  === Страница {page_num}/{max_pages} ===")
         
-        # Формируем URL для страницы
         if page_num == 1:
             page_url = category_url
         else:
-            # Добавляем параметр пагинации
             if '?' in category_url:
                 page_url = f"{category_url}&PAGEN_1={page_num}"
             else:
                 page_url = f"{category_url}?PAGEN_1={page_num}"
         
-        # Загружаем страницу
         try:
             page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
@@ -217,13 +415,30 @@ def get_category_images(page, category_url, category_name):
             last_height = new_height
             scroll_attempts += 1
         
-        # Извлекаем картинки
+        # Получаем HTML и парсим
         html = page.content()
         soup = BeautifulSoup(html, 'html.parser')
-        page_images = extract_images_from_page(soup)
         
-        print(f"    Найдено изображений: {len(page_images)}")
-        all_images.extend(page_images)
+        # Извлекаем карточки товаров
+        product_cards = soup.find_all(['div', 'article'], class_=re.compile(r'product|item|card', re.I))
+        
+        page_products = 0
+        for card in product_cards:
+            # Извлекаем данные о товаре
+            product_data = extract_product_from_card(card, category_name)
+            
+            if product_data.get('product_id') or product_data.get('name'):
+                # Сохраняем в базу данных
+                if save_product_to_db(db_conn, product_data):
+                    saved_products += 1
+                    page_products += 1
+                
+                # Извлекаем изображение
+                if product_data.get('image_url'):
+                    all_images.append(product_data['image_url'])
+        
+        page_images = extract_images_from_page(soup)
+        print(f"    Найдено товаров: {page_products}, изображений: {len(page_images)}")
         
         time.sleep(1)
     
@@ -250,7 +465,8 @@ def get_category_images(page, category_url, category_name):
             downloaded += 1
     
     print(f"  Скачано {downloaded} из {len(unique_images)} изображений")
-    return downloaded
+    print(f"  Сохранено товаров в БД: {saved_products}")
+    return downloaded, saved_products
 
 def main():
     print("=" * 60)
@@ -258,6 +474,11 @@ def main():
     print("=" * 60)
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Инициализируем базу данных
+    print("\nИнициализация базы данных...")
+    db_conn = init_database()
+    print(f"База данных: {DB_FILE}")
     
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -288,17 +509,34 @@ def main():
             print(f"{'=' * 60}\n")
             
             total_downloaded = 0
+            total_products = 0
+            
             for idx, category in enumerate(categories, 1):
                 print(f"\n[{idx}/{len(categories)}] Обработка: {category['name']}")
-                downloaded = get_category_images(page, category['url'], category['name'])
+                downloaded, products = get_category_images(page, category['name'], category['url'], db_conn)
                 total_downloaded += downloaded
+                total_products += products
                 
                 time.sleep(2)
             
             print(f"\n{'=' * 60}")
-            print(f"ГОТОВО! Всего скачано изображений: {total_downloaded}")
+            print(f"ГОТОВО!")
+            print(f"Всего скачано изображений: {total_downloaded}")
+            print(f"Всего сохранено товаров: {total_products}")
             print(f"Файлы сохранены в папку: {os.path.abspath(OUTPUT_DIR)}")
+            print(f"База данных: {os.path.abspath(DB_FILE)}")
             print(f"{'=' * 60}")
+            
+            # Выводим статистику из БД
+            cursor = db_conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM products")
+            total_in_db = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(DISTINCT category) FROM products")
+            categories_in_db = cursor.fetchone()[0]
+            
+            print(f"\nСтатистика базы данных:")
+            print(f"  Всего товаров: {total_in_db}")
+            print(f"  Категорий: {categories_in_db}")
             
         except KeyboardInterrupt:
             print("\n\nПрервано пользователем")
@@ -307,7 +545,8 @@ def main():
             import traceback
             traceback.print_exc()
         finally:
-            print("\nЗакрываю браузер...")
+            print("\nЗакрываю браузер и базу данных...")
+            db_conn.close()
             browser.close()
 
 if __name__ == "__main__":
